@@ -10,48 +10,71 @@ After the first USB flash, every subsequent upload is wireless over Wi-Fi.
 ```
 esp32-ota-blink/
 ├── platformio.ini
-├── include/secrets.h
-├── include/config.h      ← only file you normally need to edit
+├── include/
+│   ├── secrets.h          ← WiFi credentials (git-ignored, you create this)
+│   ├── secrets.h.example  ← template to copy from
+│   └── config.h           ← everything else (blink count, LED pin, hostname)
 ├── src/main.cpp
-└── esp32_ota.py          ← Python helper (check / scan / flash / upload)
+└── esp32_ota.py           ← Python helper (check / scan / flash / upload)
 ```
 
 ---
 
 ## Quick start
 
-### 1 — Configure
+### 1 — Add your WiFi credentials
 
-Edit **`include/secrets.h`**:
+Copy the example file and fill it in:
 
-```cpp
-#define WIFI_SSID     "YOUR_SSID"
-#define WIFI_PASSWORD "YOUR_PASSWORD"
+```bash
+cp include/secrets.h.example include/secrets.h
 ```
 
-Set `LED_PIN` in `include/config.h` if your board's built-in LED isn't on GPIO 2.
+Then edit `include/secrets.h`:
 
-### 2 — Install Python dependencies (once)
+```cpp
+#define WIFI_SSID     "your-network-name"
+#define WIFI_PASSWORD "your-password"
+```
+
+`secrets.h` is listed in `.gitignore` and will never be committed.  
+`secrets.h.example` (with placeholder values) is safe to commit.
+
+### 2 — Tweak settings (optional)
+
+Edit `include/config.h` for anything else:
+
+```cpp
+#define BLINK_COUNT  2    // ← number of blinks per cycle
+#define LED_PIN      2    // ← GPIO for built-in LED (DevKit=2, LOLIN D32=5)
+```
+
+### 3 — Install dependencies
+
+#### [Recommended] Using Docker
+
+Install Docker on Linux.
+
+#### Without using the `run.sh` script
 
 ```bash
 pip install pyserial zeroconf
 ```
 
-### 3 — First USB flash (assigns a unique hostname)
+### 4 — First USB flash (assigns a unique hostname)
 
 ```bash
-python esp32_ota.py flash --port /dev/ttyUSB0 --hostname esp32-blink-1
+./run.sh flash --port /dev/ttyUSB0 --hostname esp32-blink-1
 ```
 
-The `--hostname` flag bakes the name into the firmware as a compiler define
-(`-DOTA_HOSTNAME="esp32-blink-1"`), overriding the default in `config.h`.
-**Every board on the same network must have a different hostname** —
-duplicate mDNS names break OTA discovery.
+The `--hostname` flag bakes the name into the firmware as a compiler define,
+overriding the default in `config.h`. **Every board on the same network must
+have a different hostname** — duplicate mDNS names break OTA discovery.
 
 Add `--verify` to query the board over serial right after flashing:
 
 ```bash
-python esp32_ota.py flash --port /dev/ttyUSB0 --hostname esp32-blink-1 --verify
+./run.sh flash --port /dev/ttyUSB0 --hostname esp32-blink-1 --verify
 ```
 
 ---
@@ -59,22 +82,19 @@ python esp32_ota.py flash --port /dev/ttyUSB0 --hostname esp32-blink-1 --verify
 ## Serial command protocol
 
 Once the firmware is running you can query the board interactively from any
-serial terminal at **115200 baud**, or via the Python `check` sub-command:
+serial terminal at **115200 baud**, or via the `check` sub-command:
 
-| Send      | Response                          |
-|-----------|-----------------------------------|
-| `get_ip`       | `[CMD] IP: 192.168.1.42`     |
-| `get_mac`      | `[CMD] MAC: AA:BB:CC:DD:EE:FF` |
+| Send           | Response                        |
+|----------------|---------------------------------|
+| `get_ip`       | `[CMD] IP: 192.168.1.42`        |
+| `get_mac`      | `[CMD] MAC: AA:BB:CC:DD:EE:FF`  |
 | `get_hostname` | `[CMD] HOSTNAME: esp32-blink-1` |
-| `get_info`     | all three lines above          |
-| `help`         | command list                   |
+| `get_info`     | all three lines above           |
+| `help`         | command list                    |
 
 ```bash
-# Default: sends get_info
-python esp32_ota.py check --port /dev/ttyUSB0
-
-# Ask only for the IP
-python esp32_ota.py check --port /dev/ttyUSB0 --cmd get_ip
+./run.sh check --port /dev/ttyUSB0           # sends get_info by default
+./run.sh check --port /dev/ttyUSB0 --cmd get_ip
 ```
 
 ---
@@ -82,14 +102,9 @@ python esp32_ota.py check --port /dev/ttyUSB0 --cmd get_ip
 ## Scan the network
 
 ```bash
-# Show all ArduinoOTA boards visible on the LAN
-python esp32_ota.py scan
-
-# Filter with a wildcard (fnmatch-style)
-python esp32_ota.py scan --pattern "esp32-blink-*"
-
-# Extend browse window if boards are slow to appear
-python esp32_ota.py scan --timeout 8
+./run.sh scan                              # all ArduinoOTA boards on the LAN
+./run.sh scan --pattern "esp32-blink-*"   # wildcard filter
+./run.sh scan --timeout 8                 # extend browse window
 ```
 
 Output:
@@ -110,24 +125,34 @@ Output:
 
 ## OTA upload (wireless, no USB needed)
 
-Change `BLINK_COUNT` to 3 in `config.h`, then:
+Change `BLINK_COUNT` to 3 in `config.h`, then pick whichever targeting method
+is most convenient:
 
 ```bash
-# By hostname — resolves via mDNS (most convenient)
-python esp32_ota.py upload --hostname esp32-blink-1
+# By MAC address — resolved via local ARP cache (no mDNS, no USB)
+./run.sh upload --mac 80:F3:DA:54:DB:E0
+
+# By hostname — resolved via mDNS
+./run.sh upload --hostname esp32-blink-1
 
 # By direct IP
-python esp32_ota.py upload --ip 192.168.1.42
+./run.sh upload --ip 192.168.1.42
 
 # Ask the board over USB serial, then upload wirelessly
-python esp32_ota.py upload --port /dev/ttyUSB0
-
-# Verify MAC matches before uploading (safe with multiple boards)
-python esp32_ota.py upload --port /dev/ttyUSB0 --mac AA:BB:CC:DD:EE:FF
+./run.sh upload --port /dev/ttyUSB0
 
 # Plain PlatformIO CLI (no script needed)
 pio run -e esp32_ota -t upload --upload-port 192.168.1.42
 ```
+
+Target resolution priority (first match wins):
+
+| Method | How | Requirement |
+|---|---|---|
+| `--mac` | ARP cache lookup | Board must have sent traffic recently |
+| `--hostname` | mDNS browse | zeroconf on host |
+| `--ip` | Direct | Know the IP |
+| `--port` | Ask board over serial | USB cable |
 
 ---
 
@@ -135,7 +160,10 @@ pio run -e esp32_ota -t upload --upload-port 192.168.1.42
 
 | Symptom | Fix |
 |---|---|
-| `Connection refused` | Board not on Wi-Fi; check SSID/password in `config.h` |
+| `fatal error: secrets.h: No such file` | Copy `secrets.h.example` → `secrets.h` |
+| WiFi connecting to `YOUR_SSID` | You forgot to edit `secrets.h` |
+| `Connection refused` on OTA | Board not on Wi-Fi; check `secrets.h` credentials |
+| MAC not found in ARP cache | Ping the board first: `ping 192.168.1.x` or use `--hostname` |
 | mDNS won't resolve | Install avahi-daemon (Linux) or enable Bonjour (Windows) |
 | Two boards, same hostname | Re-flash each with a unique `--hostname` |
 | `Auth Failed` on OTA | `OTA_PASSWORD` mismatch; leave `""` to disable |
