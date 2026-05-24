@@ -305,6 +305,30 @@ def resolve_hostname_mdns(hostname: str, timeout: float = 5.0) -> str | None:
     return None
 
 
+def resolve_mac_arp(mac: str) -> str | None:
+    """
+    Look up *mac* in the local ARP cache and return the associated IP, or None.
+
+    The ARP cache is populated automatically once the device has sent any
+    packet on the LAN (e.g. its DHCP request or any TCP/UDP traffic).
+    No router access required.
+    """
+    target = mac.upper().replace("-", ":")
+
+    # ── 1. /proc/net/arp (Linux) ──────────────────────────────────────────
+    try:
+        with open("/proc/net/arp") as f:
+            for line in f:
+                parts = line.split()
+                # columns: IP HWtype Flags HWaddress Mask Device
+                if len(parts) >= 4 and parts[3].upper() == target:
+                    return parts[0]
+    except FileNotFoundError:
+        pass   # not Linux
+
+    return None
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  Build / upload helpers
 # ═══════════════════════════════════════════════════════════════════════════
@@ -442,8 +466,23 @@ def cmd_upload(args) -> None:
 
     target_ip  = args.ip
     target_host = args.hostname
+    target_mac  = args.mac
 
     # ── Resolve target IP ─────────────────────────────────────────────────
+
+    # 1. MAC → IP via ARP cache (no USB, no mDNS needed)
+    if not target_ip and target_mac:
+        print(f"[arp]  Looking up {target_mac} in local ARP cache…")
+        target_ip = resolve_mac_arp(target_mac)
+        if target_ip:
+            print(f"[arp]  Resolved → {target_ip}")
+        else:
+            print(f"[warn] MAC {target_mac} not found in ARP cache.")
+            print(f"       The board may not have sent any traffic recently.")
+            print(f"       Ping it first, or use --hostname / --port instead.")
+            sys.exit(1)
+
+    # 2. Hostname → IP via mDNS
     if not target_ip and target_host:
         print(f"[mdns] Resolving {target_host}.local …")
         target_ip = resolve_hostname_mdns(target_host)
@@ -462,9 +501,10 @@ def cmd_upload(args) -> None:
         results, diag = serial_command(port, "get_info", timeout=args.timeout)
         info = {r["key"]: r["value"] for r in results}
 
-        if args.mac and "MAC" in info:
-            if info["MAC"].upper() != args.mac.upper():
-                print(f"[error] MAC mismatch: found {info['MAC']}, expected {args.mac}")
+        # If --mac was given alongside --port, verify it matches the board
+        if target_mac and "MAC" in info:
+            if info["MAC"].upper() != target_mac.upper():
+                print(f"[error] MAC mismatch: found {info['MAC']}, expected {target_mac}")
                 sys.exit(1)
 
         target_ip   = info.get("IP")
@@ -482,7 +522,7 @@ def cmd_upload(args) -> None:
             sys.exit(1)
 
     if not target_ip:
-        print("[error] Specify --ip, --hostname, or --port. See --help.")
+        print("[error] Specify --ip, --hostname, --mac, or --port. See --help.")
         sys.exit(1)
 
     print(f"\n[info] Target hostname : {target_host or '(unknown)'}")
@@ -583,7 +623,9 @@ def main():
     )
     p_upload.add_argument(
         "--mac",
-        help="Expected MAC; used to verify the right board when reading from --port.",
+        help="Board MAC address. Resolves to IP via the local ARP cache — "
+             "no USB or mDNS needed. Also used to verify the correct board "
+             "when combined with --port.",
     )
     p_upload.add_argument(
         "--env", default=OTA_ENV,
