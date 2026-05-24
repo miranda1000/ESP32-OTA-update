@@ -20,7 +20,7 @@
 #define LED_PIN 2
 
 // ── Blink pattern ────────────────────────────────────────────────────────────
-#define BLINK_COUNT  2     // ← change to 3 for the second OTA upload
+#define BLINK_COUNT  3
 #define BLINK_ON_MS  200
 #define BLINK_OFF_MS 200
 #define DARK_MS      4000

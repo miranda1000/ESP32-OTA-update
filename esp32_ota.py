@@ -27,11 +27,6 @@ Examples
   python esp32_ota.py upload --hostname esp32-blink-1   # resolve via mDNS
   python esp32_ota.py upload --ip 192.168.1.42          # direct IP
   python esp32_ota.py upload --port /dev/ttyUSB0        # ask the board
-
-Requirements
-────────────
-  pip install pyserial zeroconf
-  PlatformIO (pio) must be on PATH.
 """
 
 import argparse
@@ -73,6 +68,13 @@ BOOT_MAC     = re.compile(r"\[boot\]\s+MAC\s*:\s*([0-9A-Fa-f:]{17})")
 BOOT_IP      = re.compile(r"\[boot\]\s+IP\s*:\s*(\d{1,3}(?:\.\d{1,3}){3})")
 BOOT_HOST    = re.compile(r"\[boot\]\s+Hostname\s*:\s*(\S+)")
 
+# Diagnostic patterns — used to give specific failure messages
+DIAG_WIFI_CONNECTING = re.compile(r"\[WiFi\] Connecting to (.+)")
+DIAG_WIFI_CONNECTED  = re.compile(r"\[WiFi\] Connected")
+DIAG_WIFI_TIMEOUT    = re.compile(r"\[WiFi\] Timeout")
+DIAG_BROWNOUT        = re.compile(r"Brownout detector was triggered")
+DIAG_BOOT_ROM        = re.compile(r"ets \w+ \d+ \d+ \d+:\d+:\d+")  # ROM bootloader line
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  Serial helpers
@@ -97,13 +99,29 @@ def _pick_port() -> str | None:
         return None
 
 
-def serial_command(port: str, command: str, timeout: int = CMD_TIMEOUT) -> list[dict]:
+def serial_command(port: str, command: str, timeout: int = CMD_TIMEOUT) -> tuple[list[dict], dict]:
     """
     Send *command* over serial and collect all [CMD] reply lines.
 
-    Returns a list of dicts: [{"key": "IP", "value": "192.168.1.42"}, …]
+    Returns:
+        results  – list of dicts: [{"key": "IP", "value": "192.168.1.42"}, …]
+        diag     – dict of observed conditions for failure diagnosis:
+                   {
+                     "wifi_ssid":      str | None,   # SSID seen in "Connecting to …"
+                     "wifi_connected": bool,
+                     "wifi_timeout":   bool,
+                     "brownout":       bool,
+                     "saw_bootrom":    bool,          # ROM bootloader output seen
+                   }
     """
     results = []
+    diag = {
+        "wifi_ssid":      None,
+        "wifi_connected": False,
+        "wifi_timeout":   False,
+        "brownout":       False,
+        "saw_bootrom":    False,
+    }
     try:
         with serial.Serial(port, BAUD_RATE, timeout=1) as ser:
             ser.reset_input_buffer()
@@ -118,8 +136,20 @@ def serial_command(port: str, command: str, timeout: int = CMD_TIMEOUT) -> list[
                 line = raw.decode("utf-8", errors="replace").strip()
                 if line:
                     print(f"  ← {line}")
-                m = CMD_PATTERN.search(line)
-                if m:
+
+                # Collect diagnostics from every line regardless of [CMD]
+                if m := DIAG_WIFI_CONNECTING.search(line):
+                    diag["wifi_ssid"] = m.group(1).strip()
+                if DIAG_WIFI_CONNECTED.search(line):
+                    diag["wifi_connected"] = True
+                if DIAG_WIFI_TIMEOUT.search(line):
+                    diag["wifi_timeout"] = True
+                if DIAG_BROWNOUT.search(line):
+                    diag["brownout"] = True
+                if DIAG_BOOT_ROM.search(line):
+                    diag["saw_bootrom"] = True
+
+                if m := CMD_PATTERN.search(line):
                     results.append({"key": m.group(1), "value": m.group(2).strip()})
                     # Single-key commands finish after one [CMD] line;
                     # get_info sends 3 lines, so keep reading until timeout.
@@ -127,7 +157,50 @@ def serial_command(port: str, command: str, timeout: int = CMD_TIMEOUT) -> list[
                         break
     except serial.SerialException as exc:
         print(f"[error] Serial error on {port}: {exc}")
-    return results
+    return results, diag
+
+
+def _diagnose(diag: dict, command: str) -> None:
+    """Print a specific failure reason based on observed serial output."""
+    if diag["brownout"]:
+        print("[warn] Brownout detected — the board is restarting repeatedly.")
+        print("       This usually means insufficient USB power. Try a different")
+        print("       cable or port, or add a capacitor across the 3.3 V rail.")
+
+    if diag["wifi_ssid"] and not diag["wifi_connected"]:
+        ssid = diag["wifi_ssid"]
+        if ssid in ("YOUR_SSID", "YOUR_WIFI_SSID"):
+            print(f"[warn] WiFi credentials are still the placeholder values.")
+            print(f"       Edit include/config.h and set WIFI_SSID / WIFI_PASSWORD,")
+            print(f"       then re-flash with:  ./run.sh flash --port <port>")
+        else:
+            print(f"[warn] Board is trying to connect to '{ssid}' but failing.")
+            print(f"       Check that the SSID and password in include/config.h are")
+            print(f"       correct and that the board is within range.")
+        print(f"       The serial command handler only starts after WiFi connects.")
+        return
+
+    if diag["wifi_timeout"]:
+        print("[warn] WiFi connection timed out — board restarted before responding.")
+        return
+
+    if diag["saw_bootrom"] and not diag["wifi_ssid"]:
+        print("[warn] Saw ESP32 ROM bootloader output but no firmware log.")
+        print("       The board may be in flash mode or running different firmware.")
+        print("       Re-flash with:  ./run.sh flash --port <port>")
+        return
+
+    if not diag["saw_bootrom"] and not diag["wifi_ssid"]:
+        print("[warn] No output received at all.")
+        print("       — Wrong baud rate? (firmware uses 115200)")
+        print("       — Board not running this project's firmware?")
+        print("       — Try pressing EN/RESET and re-running.")
+        return
+
+    # Catch-all if none of the above matched
+    print(f"[warn] No [CMD] response to '{command}'.")
+    print("       The board is running but did not answer — try again once")
+    print("       you see '[boot] Type help for serial commands' in the output.")
 
 
 def read_boot_info(port: str, timeout: int = 20) -> dict:
@@ -281,12 +354,11 @@ def cmd_check(args) -> None:
     command = args.cmd  # e.g. get_info, get_ip, get_mac, get_hostname, help
 
     print(f"\n[serial] → {command}")
-    results = serial_command(port, command, timeout=args.timeout)
+    results, diag = serial_command(port, command, timeout=args.timeout)
 
     if not results:
-        print("\n[warn] No [CMD] response received.")
-        print("       Is the firmware from this project running on the board?")
-        print("       Try pressing EN/RESET and re-running.")
+        print()
+        _diagnose(diag, command)
         sys.exit(1)
 
     print()
@@ -351,13 +423,14 @@ def cmd_flash(args) -> None:
         print("\n[verify] Waiting for board to reboot…")
         time.sleep(3)
         print("[verify] Querying board…")
-        results = serial_command(port, "get_info", timeout=10)
+        results, diag = serial_command(port, "get_info", timeout=10)
         if results:
             print()
             for r in results:
                 print(f"  {r['key']}: {r['value']}")
         else:
-            print("[verify] No response — press EN/RESET and run 'check' manually.")
+            print()
+            _diagnose(diag, "get_info")
 
 
 def cmd_upload(args) -> None:
@@ -386,7 +459,7 @@ def cmd_upload(args) -> None:
         if not port:
             sys.exit(1)
         print(f"\n[serial] Querying board on {port} for its IP…")
-        results = serial_command(port, "get_info", timeout=args.timeout)
+        results, diag = serial_command(port, "get_info", timeout=args.timeout)
         info = {r["key"]: r["value"] for r in results}
 
         if args.mac and "MAC" in info:
